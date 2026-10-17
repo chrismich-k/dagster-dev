@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 
 import dagster._check as check
 from dagster import DagsterEventType
+from dagster._core.events import EngineEventData
 from dagster._core.instance import DagsterInstance
 from dagster._core.storage.dagster_run import RunRecord, RunsFilter
 from dagster._core.workspace.context import IWorkspaceProcessContext
 from dagster._daemon.auto_run_reexecution.auto_run_reexecution import (
+    RETRY_DEBUG_PREFIX,
     consume_new_runs_for_automatic_reexecution,
 )
 from dagster._daemon.daemon import IntervalDaemon
@@ -87,19 +89,58 @@ class EventLogConsumerDaemon(IntervalDaemon):
             run_ids = list({event.run_id for event in events})
             run_records = instance.get_run_records(filters=RunsFilter(run_ids=run_ids))
 
+            # RETRY-DEBUG: trace every RUN_FAILURE event the daemon consumes, together with the
+            # run status it sees at that moment, so that failed runs without any debug event can
+            # still be matched against the daemon log.
+            status_by_run_id = {
+                record.dagster_run.run_id: record.dagster_run.status.value for record in run_records
+            }
+            for event in events:
+                if event.dagster_event_type == DagsterEventType.RUN_FAILURE:
+                    self._logger.info(
+                        f"{RETRY_DEBUG_PREFIX} consuming RUN_FAILURE event for run {event.run_id},"
+                        f" run status seen: {status_by_run_id.get(event.run_id, 'RUN RECORD NOT FOUND')}"
+                    )
+
             # call each handler with the list of runs that have events
             for fn in self.handle_updated_runs_fns:
                 try:
                     yield from fn(workspace_process_context, run_records, self._logger)
                 except Exception:
-                    DaemonErrorCapture.process_exception(
+                    error_info = DaemonErrorCapture.process_exception(
                         sys.exc_info(),
                         logger=self._logger,
                         log_message=f"Error calling event event log consumer handler: {fn.__name__}",  # ty: ignore[unresolved-attribute]
                     )
+                    # RETRY-DEBUG: the cursor below is persisted anyway, so runs in this batch that
+                    # were not handled yet will never be looked at again.
+                    for record in run_records:
+                        try:
+                            instance.report_engine_event(
+                                f"{RETRY_DEBUG_PREFIX} event log consumer handler"
+                                f" {fn.__name__} raised an exception while processing a batch"  # ty: ignore[unresolved-attribute]
+                                " containing this run. The event cursor will still advance, so"
+                                " this run may never be retried.",
+                                record.dagster_run,
+                                engine_event_data=EngineEventData(error=error_info),
+                            )
+                        except Exception:
+                            self._logger.exception(
+                                f"{RETRY_DEBUG_PREFIX} failed to report handler exception for"
+                                f" run {record.dagster_run.run_id}"
+                            )
+
+            self._logger.debug(
+                f"{RETRY_DEBUG_PREFIX} cursors {_format_cursors(persisted_cursors)} ->"
+                f" {_format_cursors(new_cursors)}, {len(events)} events, {len(run_ids)} runs"
+            )
 
         # persist cursors now that we've processed all the events through the handlers
         _persist_cursors(instance, new_cursors)
+
+
+def _format_cursors(cursors: Mapping[DagsterEventType, int | None]) -> str:
+    return ", ".join(f"{event_type.value}={cursor}" for event_type, cursor in cursors.items())
 
 
 def _create_cursor_key(event_type: DagsterEventType) -> str:

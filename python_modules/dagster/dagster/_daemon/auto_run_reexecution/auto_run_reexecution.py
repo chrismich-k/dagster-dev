@@ -1,12 +1,15 @@
 import logging
+import os
 import sys
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any
 
 import dagster._check as check
 from dagster._core.definitions.metadata import MetadataValue
 from dagster._core.definitions.selector import JobSubsetSelector
 from dagster._core.errors import DagsterRunNotFoundError
-from dagster._core.events import EngineEventData, RunFailureReason
+from dagster._core.events import DagsterEventType, EngineEventData, RunFailureReason
 from dagster._core.execution.backfill import BULK_ACTION_TERMINAL_STATUSES
 from dagster._core.execution.plan.resume_retry import ReexecutionStrategy
 from dagster._core.execution.retries import auto_reexecution_should_retry_run
@@ -15,6 +18,7 @@ from dagster._core.storage.dagster_run import DagsterRun, DagsterRunStatus, RunR
 from dagster._core.storage.tags import (
     AUTO_RETRY_RUN_ID_TAG,
     BACKFILL_ID_TAG,
+    MAX_RETRIES_TAG,
     RETRY_NUMBER_TAG,
     RETRY_ON_ASSET_OR_OP_FAILURE_TAG,
     RETRY_STRATEGY_TAG,
@@ -27,8 +31,153 @@ from dagster._utils.tags import get_boolean_tag_value
 
 DEFAULT_REEXECUTION_POLICY = ReexecutionStrategy.FROM_FAILURE
 
+# ---------------------------------------------------------------------------------------------
+# RETRY-DEBUG instrumentation (diagnostic build only, not intended for upstream).
+# Emits engine events prefixed with RETRY_DEBUG_PREFIX on the affected run so that it is visible
+# in the run's event log in the UI, plus a warning in the daemon log. Behavior is unchanged.
+# ---------------------------------------------------------------------------------------------
+RETRY_DEBUG_PREFIX = "[RETRY-DEBUG]"
+_RETRY_DEBUG_RECHECK_DELAY_SECONDS = float(
+    os.environ.get("DAGSTER_RETRY_DEBUG_RECHECK_DELAY_SECONDS", "2")
+)
+_retry_debug_fallback_logger = logging.getLogger("dagster.daemon.RetryDebug")
 
-def should_retry(run: DagsterRun, instance: DagsterInstance) -> bool:
+
+def _retry_debug_run_metadata(run: DagsterRun, instance: DagsterInstance) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "debug_checked_at": MetadataValue.text(time.strftime("%Y-%m-%dT%H:%M:%S%z")),
+        "debug_checked_at_ts": MetadataValue.float(time.time()),
+        "run_status_seen_by_daemon": MetadataValue.text(run.status.value),
+    }
+    for tag in (
+        WILL_RETRY_TAG,
+        RUN_FAILURE_REASON_TAG,
+        MAX_RETRIES_TAG,
+        RETRY_NUMBER_TAG,
+        RETRY_ON_ASSET_OR_OP_FAILURE_TAG,
+        AUTO_RETRY_RUN_ID_TAG,
+        BACKFILL_ID_TAG,
+    ):
+        metadata[f"tag {tag}"] = MetadataValue.text(str(run.tags.get(tag)))
+    try:
+        metadata["instance run_retries.enabled"] = MetadataValue.text(
+            str(instance.run_retries_enabled)
+        )
+        metadata["instance run_retries.max_retries"] = MetadataValue.text(
+            str(instance.run_retries_max_retries)
+        )
+        metadata["instance run_retries.retry_on_asset_or_op_failure"] = MetadataValue.text(
+            str(instance.run_retries_retry_on_asset_or_op_failure)
+        )
+        failure_records = instance.get_records_for_run(
+            run.run_id, of_type=DagsterEventType.RUN_FAILURE, limit=1, ascending=False
+        ).records
+        if failure_records:
+            metadata["run_failure_event storage_id"] = MetadataValue.int(
+                failure_records[0].storage_id
+            )
+            metadata["run_failure_event timestamp"] = MetadataValue.float(
+                failure_records[0].timestamp
+            )
+        else:
+            metadata["run_failure_event storage_id"] = MetadataValue.text("none found")
+        run_record = instance.get_run_record_by_id(run.run_id)
+        if run_record:
+            metadata["run_record status (now)"] = MetadataValue.text(
+                run_record.dagster_run.status.value
+            )
+            metadata["run_record update_timestamp (now)"] = MetadataValue.text(
+                str(run_record.update_timestamp)
+            )
+            metadata["run_record end_time (now)"] = MetadataValue.text(str(run_record.end_time))
+    except Exception as e:
+        metadata["debug_metadata_error"] = MetadataValue.text(repr(e))
+    return metadata
+
+
+def _report_retry_debug(
+    instance: DagsterInstance,
+    run: DagsterRun,
+    message: str,
+    logger: logging.Logger | None,
+    extra_metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Report a RETRY-DEBUG engine event on the run. Never raises."""
+    log = logger or _retry_debug_fallback_logger
+    full_message = f"{RETRY_DEBUG_PREFIX} {message}"
+    try:
+        metadata = _retry_debug_run_metadata(run, instance)
+        metadata.update(extra_metadata or {})
+        log.warning(f"{full_message} (run_id={run.run_id})")
+        instance.report_engine_event(full_message, run, engine_event_data=EngineEventData(metadata))
+    except Exception:
+        log.exception(f"{RETRY_DEBUG_PREFIX} failed to report debug event for run {run.run_id}")
+
+
+def _retry_debug_missing_tag_not_failed(
+    run: DagsterRun, instance: DagsterInstance, logger: logging.Logger | None
+) -> None:
+    """Instrumentation for the suspected race: the daemon saw the RUN_FAILURE event, but the run
+    record is not (yet) FAILURE and has no WILL_RETRY_TAG. The event log consumer cursor will move
+    past the event, so the run will never be looked at again.
+    """
+    if run.status == DagsterRunStatus.SUCCESS:
+        # expected: run was picked up because of its RUN_SUCCESS event
+        return
+
+    _report_retry_debug(
+        instance,
+        run,
+        f"should_retry=False: tag {WILL_RETRY_TAG} is missing and run status seen by the daemon"
+        f" is {run.status.value} (not FAILURE). The event log consumer cursor will advance past"
+        " this run's events.",
+        logger,
+    )
+
+    # Re-check after a short delay to prove the race: if the run is FAILURE now (or got the
+    # WILL_RETRY_TAG), the daemon decided on stale state and will not look at this run again.
+    try:
+        if _RETRY_DEBUG_RECHECK_DELAY_SECONDS > 0:
+            time.sleep(_RETRY_DEBUG_RECHECK_DELAY_SECONDS)
+        rechecked_run = instance.get_run_by_id(run.run_id)
+    except Exception as e:
+        _report_retry_debug(instance, run, f"recheck failed: {e!r}", logger)
+        return
+    if rechecked_run is None:
+        return
+
+    rechecked_will_retry = rechecked_run.tags.get(WILL_RETRY_TAG)
+    recheck_metadata = {
+        "recheck delay seconds": MetadataValue.float(_RETRY_DEBUG_RECHECK_DELAY_SECONDS),
+        "status before recheck": MetadataValue.text(run.status.value),
+        "status after recheck": MetadataValue.text(rechecked_run.status.value),
+        f"tag {WILL_RETRY_TAG} after recheck": MetadataValue.text(str(rechecked_will_retry)),
+    }
+    if rechecked_run.status == DagsterRunStatus.FAILURE or rechecked_will_retry is not None:
+        _report_retry_debug(
+            instance,
+            rechecked_run,
+            f"RACE CONFIRMED: run status changed {run.status.value} -> "
+            f"{rechecked_run.status.value} ({WILL_RETRY_TAG}={rechecked_will_retry}) after the"
+            " daemon already decided not to retry. The event log consumer cursor has moved past"
+            " the RUN_FAILURE event, so this run will NOT be retried automatically.",
+            logger,
+            recheck_metadata,
+        )
+    else:
+        _report_retry_debug(
+            instance,
+            rechecked_run,
+            f"recheck: run status still {rechecked_run.status.value} after"
+            f" {_RETRY_DEBUG_RECHECK_DELAY_SECONDS}s, {WILL_RETRY_TAG}={rechecked_will_retry}.",
+            logger,
+            recheck_metadata,
+        )
+
+
+def should_retry(
+    run: DagsterRun, instance: DagsterInstance, logger: logging.Logger | None = None
+) -> bool:
     """A more robust method of determining is a run should be retried by the daemon than just looking
     at the WILL_RETRY_TAG. We account for the case where the code version is old and doesn't set the
     WILL_RETRY_TAG. If the tag wasn't set for a run failure, we set it so that other daemons can use the
@@ -49,6 +198,9 @@ def should_retry(run: DagsterRun, instance: DagsterInstance) -> bool:
             instance.add_run_tags(run.run_id, {WILL_RETRY_TAG: str(should_retry_run).lower()})
         else:
             # run is not failed, and shouldn't be retried
+            # possibly discards runs that failed but didn't get the DagsterRunStatus.FAILURE yet!
+            # RETRY-DEBUG: check and report as an event
+            _retry_debug_missing_tag_not_failed(run, instance, logger)
             return False
     else:
         should_retry_run = get_boolean_tag_value(will_retry_tag_value, default_value=False)
@@ -88,15 +240,27 @@ def should_retry(run: DagsterRun, instance: DagsterInstance) -> bool:
                 "are configured with retry_on_asset_or_op_failure set to false.",
                 run,
             )
+        else:
+            # RETRY-DEBUG: make the otherwise silent "will not retry" decision visible
+            _report_retry_debug(
+                instance,
+                run,
+                f"should_retry=False: {WILL_RETRY_TAG}="
+                f"{will_retry_tag_value if will_retry_tag_value is not None else '(missing, computed by daemon: false)'}"
+                f" (failure_reason={run_failure_reason.value if run_failure_reason else None}).",
+                logger,
+            )
         return False
 
 
 def filter_runs_to_should_retry(
-    runs: Sequence[DagsterRun], instance: DagsterInstance
+    runs: Sequence[DagsterRun],
+    instance: DagsterInstance,
+    logger: logging.Logger | None = None,
 ) -> Iterator[DagsterRun]:
     """Return only runs that should retry along with their retry number (1st retry, 2nd, etc.)."""
     for run in runs:
-        if should_retry(run, instance):
+        if should_retry(run, instance, logger):
             yield run
 
 
@@ -149,6 +313,7 @@ def get_reexecution_strategy(
 def retry_run(
     failed_run: DagsterRun,
     workspace_context: IWorkspaceProcessContext,
+    logger: logging.Logger | None = None,
 ) -> None:
     """Submit a retry as a re-execute from failure."""
     instance = workspace_context.instance
@@ -218,6 +383,20 @@ def retry_run(
         instance=instance, run=failed_run, run_group=run_group_list
     )
     if existing_retried_run is not None:
+        # RETRY-DEBUG: no new retry run is launched in this branch
+        _report_retry_debug(
+            instance,
+            failed_run,
+            f"retry_run: found existing retry run {existing_retried_run.run_id} with status"
+            f" {existing_retried_run.status.value}; no new retry run is created"
+            + (
+                " (it will be submitted now)."
+                if existing_retried_run.status == DagsterRunStatus.NOT_STARTED
+                else "."
+            ),
+            logger,
+            {"existing retry run": MetadataValue.dagster_run(existing_retried_run.run_id)},
+        )
         # ensure the failed_run has the AUTO_RETRY_RUN_ID_TAG set
         if failed_run.tags.get(AUTO_RETRY_RUN_ID_TAG) is None:
             instance.add_run_tags(
@@ -272,10 +451,11 @@ def consume_new_runs_for_automatic_reexecution(
     for run in filter_runs_to_should_retry(
         [run_record.dagster_run for run_record in run_records],
         workspace_process_context.instance,
+        logger,
     ):
         yield
         try:
-            retry_run(run, workspace_process_context)
+            retry_run(run, workspace_process_context, logger)
         except Exception:
             error_info = DaemonErrorCapture.process_exception(
                 exc_info=sys.exc_info(),
